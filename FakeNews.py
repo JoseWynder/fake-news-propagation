@@ -1,250 +1,176 @@
-"""
-Simulação sequencial de Propagação de Fake News
+"""Execucao paralela da simulacao de fake news usando threads."""
 
-Estados:
-0 = Ignorante: ainda não recebeu/acredita na informação
-1 = Espalhador: acredita e compartilha a informação
-2 = Inativo: recebeu a informação, mas não compartilha mais
+from __future__ import annotations
 
-Fluxograma básico:
-Início
-  ↓
-Criar grade inicial
-  ↓
-Para cada geração
-  ↓
-Calcular próxima geração usando a grade atual
-  ↓
-Contar estados
-  ↓
-Imprimir estatísticas
-  ↓
-Ainda existem espalhadores e ainda há gerações?
-  ↓ sim
-Próxima geração
-  ↓
-Calcular próxima geração usando a grade atual
-  ↓ não
-Resultado final
-
-"""
-
-import random
+import argparse
 import time
-from copy import deepcopy
-# o deepcopy garante independência, as alterações em objetos 
-# aninhados não afetam o original
+from threading import Thread
 
-IGNORANTE = 0
-ESPALHADOR = 1
-INATIVO = 2
-
-
-def criar_grade(linhas, colunas, percentual_espalhadores=0.02, semente=42):
-    """
-    Cria uma matriz inicial.
-    A maior parte da população começa ignorante.
-    Uma pequena parte começa como espalhadora da fake news.
-    """
-    random.seed(semente)
-
-    grade = [[IGNORANTE for _ in range(colunas)] for _ in range(linhas)]
-
-    total_celulas = linhas * colunas
-    total_espalhadores = int(total_celulas * percentual_espalhadores)
-
-    for _ in range(total_espalhadores):
-        i = random.randint(0, linhas - 1)
-        j = random.randint(0, colunas - 1)
-        grade[i][j] = ESPALHADOR
-
-    return grade
+from FakeNewsModelo import (
+    ESPALHADOR,
+    IGNORANTE,
+    INATIVO,
+    copiar_grade,
+    contar_estados,
+    calcular_linha_proxima_geracao,
+    criar_grade,
+    dividir_faixas,
+    imprimir_grade,
+)
 
 
-def contar_vizinhos_espalhadores(grade, i, j):
-    """
-    Conta quantos vizinhos ao redor da célula estão espalhando a fake news.
-    Usa vizinhança de Moore: até 8 vizinhos.
-    A vizinhança de Moore é o conjunto das 8 células ao redor de uma célula 
-    central em uma matriz 2D.
-    Por exemplo considere X em:
-    A B C
-    D X E
-    F G H
-    a vizinhança de Moore seria:
-    A B C
-    D   E
-    F G H    
-    """
-    linhas = len(grade)
-    colunas = len(grade[0])
-
-    total = 0
-
-    for di in [-1, 0, 1]:
-        for dj in [-1, 0, 1]:
-            # Quando di == 0 e dj == 0, temos a própria célula central, que deve ser ignorada.
-            if di == 0 and dj == 0:
-                continue
-
-            ni = i + di
-            nj = j + dj
-
-            if 0 <= ni < linhas and 0 <= nj < colunas:
-                if grade[ni][nj] == ESPALHADOR:
-                    total += 1
-
-    return total
+def _trabalhador_faixa(grade, inicio, fim, limiar_convencimento, resultados, indice_resultado):
+    try:
+        # Cada thread escreve apenas no seu espaco de resultado.
+        resultados[indice_resultado] = (
+            inicio,
+            [calcular_linha_proxima_geracao(grade, i, limiar_convencimento) for i in range(inicio, fim)],
+        )
+    except Exception as exc:
+        resultados[indice_resultado] = exc
 
 
-def proxima_geracao(grade, limiar_convencimento=2):
-    """
-    Calcula a próxima geração da simulação.
+def proxima_geracao_paralela(grade, limiar_convencimento=2, quantidade_threads=4):
+    faixas = dividir_faixas(len(grade), quantidade_threads)
+    if not faixas:
+        return []
 
-    Regra simplificada:
-    - Ignorante vira espalhador se tiver pelo menos 'limiar_convencimento'
-      vizinhos espalhadores.
-    - Espalhador vira inativo na próxima geração.
-    - Inativo permanece inativo.
+    resultados = [None] * len(faixas)
+    threads = []
 
-    Importante:
-    Usa uma nova matriz para evitar atualização "ao vivo".
-    """
-    linhas = len(grade)
-    colunas = len(grade[0])
+    # Divisao e estavel: uma faixa continua de linhas por thread
+    for indice, (inicio, fim) in enumerate(faixas):
+        thread = Thread(
+            target=_trabalhador_faixa,
+            args=(grade, inicio, fim, limiar_convencimento, resultados, indice),
+        )
+        thread.start()
+        threads.append(thread)
 
-    nova_grade = deepcopy(grade)
+    for thread in threads:
+        # O join garante que a proxima geracao so avance quando todas terminarem
+        thread.join()
 
-    for i in range(linhas):
-        for j in range(colunas):
-
-            if grade[i][j] == IGNORANTE:
-                vizinhos = contar_vizinhos_espalhadores(grade, i, j)
-
-                if vizinhos >= limiar_convencimento:
-                    nova_grade[i][j] = ESPALHADOR
-
-            elif grade[i][j] == ESPALHADOR:
-                nova_grade[i][j] = INATIVO
-
-            elif grade[i][j] == INATIVO:
-                nova_grade[i][j] = INATIVO
+    nova_grade = []
+    for item in sorted(resultados, key=lambda valor: valor[0] if isinstance(valor, tuple) else -1):
+        if isinstance(item, Exception):
+            raise item
+        nova_grade.extend(item[1])
 
     return nova_grade
 
 
-def contar_estados(grade):
-    """
-    Conta quantas células existem em cada estado.
-    """
-    contagem = {
-        IGNORANTE: 0,
-        ESPALHADOR: 0,
-        INATIVO: 0
-    }
-
-    for linha in grade:
-        for celula in linha:
-            contagem[celula] += 1
-
-    return contagem
-
-
-def imprimir_grade(grade, limite=30):
-    """
-    Mostra parte da grade no terminal.
-    Use apenas para grades pequenas ou para demonstração.
-    """
-    simbolos = {
-        IGNORANTE: ".",
-        ESPALHADOR: "E",
-        INATIVO: "N"
-    }
-
-    linhas = min(len(grade), limite)
-    colunas = min(len(grade[0]), limite)
-
-    for i in range(linhas):
-        linha = ""
-        for j in range(colunas):
-            linha += simbolos[grade[i][j]] + " "
-        print(linha)
-    print()
-
-
-def executar_simulacao(
-    linhas=100,
-    colunas=100,
-    geracoes=50,
-    percentual_espalhadores=0.02,
-    limiar_convencimento=2,
-    mostrar_grade=False
+def executar_paralela(
+    grade_inicial,
+    geracoes,
+    limiar_convencimento,
+    quantidade_threads,
+    mostrar_grade=False,
+    mostrar_progresso=True,
 ):
-    """
-    Executa a simulação sequencial completa.
-    """
+    grade = copiar_grade(grade_inicial)
+    total_celulas = len(grade) * len(grade[0])
 
-    grade = criar_grade(
-        linhas,
-        colunas,
-        percentual_espalhadores
-    )
+    if mostrar_progresso:
+        contagem_inicial = contar_estados(grade)
+        print("=== SIMULACAO PARALELA DE PROPAGACAO DE FAKE NEWS ===")
+        print(f"Tamanho da grade: {len(grade)} x {len(grade[0])} ({total_celulas:,} pessoas)")
+        print(f"Geracoes: {geracoes}")
+        print(
+            "Percentual inicial de espalhadores: "
+            f"{contagem_inicial[ESPALHADOR] / total_celulas * 100:.2f}% "
+            f"({contagem_inicial[ESPALHADOR]:,} espalhadores reais)"
+        )
+        print(f"Limiar de convencimento: {limiar_convencimento} vizinhos")
+        print(f"Threads: {quantidade_threads}")
+        print()
 
-    print("=== SIMULAÇÃO SEQUENCIAL DE PROPAGAÇÃO DE FAKE NEWS ===")
-    print(f"Tamanho da grade: {linhas} x {colunas} ({linhas*colunas:,}) pessoas)")
-    print(f"Gerações: {geracoes}")
-    contagem_inicial = contar_estados(grade)
-    print(
-        f"Percentual inicial de espalhadores: "
-        f"{percentual_espalhadores * 100:.2f}% "
-        f"({contagem_inicial[ESPALHADOR]:,} espalhadores reais)"
-    )
-    print(f"Limiar de convencimento: {limiar_convencimento} vizinhos")
-    print()
+    inicio_tempo = time.perf_counter()
 
-    inicio = time.time()
-
+    geracao_executada = 0
     for geracao in range(geracoes):
-        grade = proxima_geracao(grade, limiar_convencimento)
+        grade = proxima_geracao_paralela(grade, limiar_convencimento, quantidade_threads)
+        geracao_executada = geracao + 1
 
         contagem = contar_estados(grade)
 
-        print(
-            f"Geração {geracao + 1:03d} | "
-            f"Ignorantes: {contagem[IGNORANTE]:>10,} | "
-            f"Espalhadores: {contagem[ESPALHADOR]:>10,} | "
-            f"Inativos: {contagem[INATIVO]:>10,}"
-        )
+        if mostrar_progresso:
+            print(
+                f"Geracao {geracao + 1:03d} | "
+                f"Ignorantes: {contagem[IGNORANTE]:>10,} | "
+                f"Espalhadores: {contagem[ESPALHADOR]:>10,} | "
+                f"Inativos: {contagem[INATIVO]:>10,}"
+            )
 
         if mostrar_grade:
             imprimir_grade(grade)
 
         if contagem[ESPALHADOR] == 0:
-            print("\nA propagação terminou: não há mais espalhadores.")
+            if mostrar_progresso:
+                print("\nA propagacao terminou: nao ha mais espalhadores.")
             break
 
-    fim = time.time()
-
-    tempo_total = fim - inicio
-
-    print()
-    print("=== RESULTADO FINAL ===")
-    print(f"Tempo total de execução: {tempo_total:.4f} segundos")
-
+    tempo_total = time.perf_counter() - inicio_tempo
     contagem_final = contar_estados(grade)
-    total = linhas * colunas
 
-    print(f"Ignorantes finais: {contagem_final[IGNORANTE]:,} ({contagem_final[IGNORANTE] / total * 100:,.2f}%)")
-    print(f"Espalhadores finais: {contagem_final[ESPALHADOR]:,} ({contagem_final[ESPALHADOR] / total * 100:,.2f}%)")
-    print(f"Inativos finais: {contagem_final[INATIVO]:,} ({contagem_final[INATIVO] / total * 100:,.2f}%)")
+    if mostrar_progresso:
+        print()
+        print("=== RESULTADO FINAL ===")
+        print(f"Tempo total de execucao: {tempo_total:.4f} segundos")
+        print(
+            f"Ignorantes finais: {contagem_final[IGNORANTE]:,} "
+            f"({contagem_final[IGNORANTE] / total_celulas * 100:.2f}%)"
+        )
+        print(
+            f"Espalhadores finais: {contagem_final[ESPALHADOR]:,} "
+            f"({contagem_final[ESPALHADOR] / total_celulas * 100:.2f}%)"
+        )
+        print(
+            f"Inativos finais: {contagem_final[INATIVO]:,} "
+            f"({contagem_final[INATIVO] / total_celulas * 100:.2f}%)"
+        )
+
+    return {
+        "grade_final": grade,
+        "tempo": tempo_total,
+        "geracoes_executadas": geracao_executada,
+        "contagem_final": contagem_final,
+    }
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Fake news simulation - parallel mode")
+    parser.add_argument("--linhas", type=int, default=500)
+    parser.add_argument("--colunas", type=int, default=500)
+    parser.add_argument("--geracoes", type=int, default=50)
+    parser.add_argument("--percentual", type=float, default=0.02)
+    parser.add_argument("--limiar", type=int, default=2)
+    parser.add_argument("--semente", type=int, default=42)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--mostrar-grade", action="store_true")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    grade_inicial = criar_grade(
+        args.linhas,
+        args.colunas,
+        percentual_espalhadores=args.percentual,
+        semente=args.semente,
+    )
+
+    executar_paralela(
+        grade_inicial,
+        args.geracoes,
+        args.limiar,
+        args.threads,
+        mostrar_grade=args.mostrar_grade,
+        mostrar_progresso=True,
+    )
 
 
 if __name__ == "__main__":
-    executar_simulacao(
-        linhas=100,
-        colunas=100,
-        geracoes=50,
-        percentual_espalhadores=0.05,
-        limiar_convencimento=3,
-        mostrar_grade=False
-    )
+    main()

@@ -208,6 +208,6 @@ java -cp . FakeNewsBenchmark --linhas 500 --colunas 500 --geracoes 50 --percentu
 ## Integrantes
 
 * JOSE WYNDER ALVES HERNANDES
-* 
+* JOÃO LUCAS SILVA DE SOUZA
 * 
 * 

@@ -6,30 +6,35 @@ import argparse
 import json
 import socket
 import time
+from pathlib import Path
 from threading import Thread
 
+from FakeNewsGraficos import gerar_grafico_historico
 from FakeNewsModelo import (
+    BOT,
     ESPALHADOR,
+    FACT_CHECKER,
     IGNORANTE,
     INATIVO,
-    copiar_grade,
+    INFLUENCIADOR,
+    calcular_metricas,
+    construir_bloco_com_halos,
     contar_estados,
+    copiar_contexto,
+    criar_contexto,
     dividir_faixas,
     imprimir_grade,
-    criar_grade,
-    construir_bloco_com_halos,
+    registrar_estatisticas,
 )
 
 
 def _packed_send(conexao, payload):
-    # Envia tamanho + JSON para evitar problemas com mensagens truncadas.
     dados = json.dumps(payload).encode("utf-8")
     conexao.sendall(len(dados).to_bytes(8, byteorder="big"))
     conexao.sendall(dados)
 
 
 def _packed_recv(conexao):
-    # Primeiro lemos o tamanho e depois o corpo completo da mensagem.
     tamanho_bytes = _recv_exact(conexao, 8)
     tamanho = int.from_bytes(tamanho_bytes, byteorder="big")
     dados = _recv_exact(conexao, tamanho)
@@ -46,12 +51,11 @@ def _recv_exact(conexao, tamanho):
     return bytes(buffer)
 
 
-def _trabalhador_socket(endereco, tarefa, limiar_convencimento, resultados, indice_resultado):
+def _trabalhador_socket(endereco, tarefa, limiar_convencimento, geracao, config, resultados, indice_resultado):
     host, porta = endereco
-    inicio, fim, bloco = tarefa
+    inicio, fim, bloco_grade, bloco_duracoes = tarefa
 
     try:
-        # Cada thread cliente conversa com um worker distinto.
         with socket.create_connection((host, porta), timeout=15) as conexao:
             _packed_send(
                 conexao,
@@ -60,7 +64,10 @@ def _trabalhador_socket(endereco, tarefa, limiar_convencimento, resultados, indi
                     "inicio": inicio,
                     "fim": fim,
                     "limiar_convencimento": limiar_convencimento,
-                    "bloco": bloco,
+                    "geracao": geracao,
+                    "config": config,
+                    "bloco_grade": bloco_grade,
+                    "bloco_duracoes": bloco_duracoes,
                 },
             )
             resposta = _packed_recv(conexao)
@@ -68,21 +75,29 @@ def _trabalhador_socket(endereco, tarefa, limiar_convencimento, resultados, indi
         if "erro" in resposta:
             raise RuntimeError(resposta["erro"])
 
-        resultados[indice_resultado] = (resposta["inicio"], resposta["linhas"])
+        resultados[indice_resultado] = (
+            resposta["inicio"],
+            resposta["linhas_grade"],
+            resposta["linhas_duracao"],
+        )
     except Exception as exc:
         resultados[indice_resultado] = exc
 
 
-def proxima_geracao_distribuida(grade, limiar_convencimento, workers):
-    faixas = dividir_faixas(len(grade), len(workers))
+def proxima_geracao_distribuida(contexto, limiar_convencimento, workers, geracao=1):
+    faixas = dividir_faixas(len(contexto["grade"]), len(workers))
     if not faixas:
-        return []
+        return copiar_contexto(contexto)
 
     tarefas = []
-    # Cada worker recebe o bloco com as fronteiras extras para calcular moore
     for (inicio, fim), endereco in zip(faixas, workers):
-        bloco = construir_bloco_com_halos(grade, inicio, fim)
-        tarefas.append((endereco, (inicio, fim, bloco)))
+        bloco_grade, bloco_duracoes = construir_bloco_com_halos(
+            contexto["grade"],
+            contexto["duracoes"],
+            inicio,
+            fim,
+        )
+        tarefas.append((endereco, (inicio, fim, bloco_grade, bloco_duracoes)))
 
     resultados = [None] * len(tarefas)
     threads = []
@@ -90,22 +105,27 @@ def proxima_geracao_distribuida(grade, limiar_convencimento, workers):
     for indice, (endereco, tarefa) in enumerate(tarefas):
         thread = Thread(
             target=_trabalhador_socket,
-            args=(endereco, tarefa, limiar_convencimento, resultados, indice),
+            args=(endereco, tarefa, limiar_convencimento, geracao, contexto["config"], resultados, indice),
         )
         thread.start()
         threads.append(thread)
 
     for thread in threads:
-        # Espera todas as respostas antes de montar a nova geracao global.
         thread.join()
 
     nova_grade = []
+    nova_duracao = []
     for item in sorted(resultados, key=lambda valor: valor[0] if isinstance(valor, tuple) else -1):
         if isinstance(item, Exception):
             raise item
         nova_grade.extend(item[1])
+        nova_duracao.extend(item[2])
 
-    return nova_grade
+    return {
+        "grade": nova_grade,
+        "duracoes": nova_duracao,
+        "config": dict(contexto["config"]),
+    }
 
 
 def _parse_workers(raw_workers):
@@ -120,19 +140,31 @@ def _parse_workers(raw_workers):
     return workers
 
 
+def _imprimir_resumo_extra(contagem):
+    print(
+        f"Influenciadores: {contagem[INFLUENCIADOR]:,} | "
+        f"Bots: {contagem[BOT]:,} | "
+        f"Fact-checkers: {contagem[FACT_CHECKER]:,}"
+    )
+
+
 def executar_distribuida(
-    grade_inicial,
+    contexto_inicial,
     geracoes,
     limiar_convencimento,
     workers,
     mostrar_grade=False,
     mostrar_progresso=True,
+    gerar_grafico=False,
+    caminho_grafico=None,
 ):
-    grade = copiar_grade(grade_inicial)
+    contexto = copiar_contexto(contexto_inicial)
+    grade = contexto["grade"]
     total_celulas = len(grade) * len(grade[0])
+    historico = []
 
     if mostrar_progresso:
-        contagem_inicial = contar_estados(grade)
+        contagem_inicial = registrar_estatisticas(historico, grade, 0)
         print("=== SIMULACAO DISTRIBUIDA DE PROPAGACAO DE FAKE NEWS ===")
         print(f"Tamanho da grade: {len(grade)} x {len(grade[0])} ({total_celulas:,} pessoas)")
         print(f"Geracoes: {geracoes}")
@@ -143,21 +175,23 @@ def executar_distribuida(
         )
         print(f"Limiar de convencimento: {limiar_convencimento} vizinhos")
         print(f"Workers: {len(workers)}")
+        _imprimir_resumo_extra(contagem_inicial)
         print()
+    else:
+        registrar_estatisticas(historico, grade, 0)
 
     inicio_tempo = time.perf_counter()
-
     geracao_executada = 0
-    for geracao in range(geracoes):
-        # O mestre coordena uma geracao inteira por vez.
-        grade = proxima_geracao_distribuida(grade, limiar_convencimento, workers)
-        geracao_executada = geracao + 1
 
-        contagem = contar_estados(grade)
+    for geracao in range(geracoes):
+        contexto = proxima_geracao_distribuida(contexto, limiar_convencimento, workers, geracao + 1)
+        geracao_executada = geracao + 1
+        grade = contexto["grade"]
+        contagem = registrar_estatisticas(historico, grade, geracao_executada)
 
         if mostrar_progresso:
             print(
-                f"Geracao {geracao + 1:03d} | "
+                f"Geracao {geracao_executada:03d} | "
                 f"Ignorantes: {contagem[IGNORANTE]:>10,} | "
                 f"Espalhadores: {contagem[ESPALHADOR]:>10,} | "
                 f"Inativos: {contagem[INATIVO]:>10,}"
@@ -166,13 +200,14 @@ def executar_distribuida(
         if mostrar_grade:
             imprimir_grade(grade)
 
-        if contagem[ESPALHADOR] == 0:
+        if contagem["propagadores_variaveis"] == 0:
             if mostrar_progresso:
-                print("\nA propagacao terminou: nao ha mais espalhadores.")
+                print("\nA propagacao terminou: nao ha mais espalhadores variaveis.")
             break
 
     tempo_total = time.perf_counter() - inicio_tempo
     contagem_final = contar_estados(grade)
+    metricas = calcular_metricas(historico, tempo_total, geracao_executada)
 
     if mostrar_progresso:
         print()
@@ -190,12 +225,25 @@ def executar_distribuida(
             f"Inativos finais: {contagem_final[INATIVO]:,} "
             f"({contagem_final[INATIVO] / total_celulas * 100:.2f}%)"
         )
+        _imprimir_resumo_extra(contagem_final)
+        print(
+            f"Pico de espalhamento: {metricas['pico_espalhamento']} "
+            f"(geracao {metricas['geracao_pico']})"
+        )
+        print(f"Geracao de estabilizacao: {metricas['geracao_estabilizacao']}")
+
+    if gerar_grafico:
+        caminho = caminho_grafico or Path("graficos") / "fake_news_distribuida.png"
+        gerar_grafico_historico(historico, caminho)
 
     return {
+        "contexto_final": contexto,
         "grade_final": grade,
         "tempo": tempo_total,
         "geracoes_executadas": geracao_executada,
         "contagem_final": contagem_final,
+        "historico": historico,
+        "metricas": metricas,
     }
 
 
@@ -209,6 +257,14 @@ def build_parser():
     parser.add_argument("--semente", type=int, default=42)
     parser.add_argument("--workers", nargs="+", required=True, help="Lista de host:port")
     parser.add_argument("--mostrar-grade", action="store_true")
+    parser.add_argument("--chance-convencimento", type=float, default=1.0)
+    parser.add_argument("--percentual-influenciadores", type=float, default=0.0)
+    parser.add_argument("--peso-influenciador", type=int, default=2)
+    parser.add_argument("--vida-influenciador", type=int, default=3)
+    parser.add_argument("--percentual-bots", type=float, default=0.0)
+    parser.add_argument("--percentual-fact-checkers", type=float, default=0.0)
+    parser.add_argument("--peso-fact-checker", type=int, default=2)
+    parser.add_argument("--gerar-grafico", action="store_true")
     return parser
 
 
@@ -217,20 +273,28 @@ def main():
     args = parser.parse_args()
 
     workers = _parse_workers(args.workers)
-    grade_inicial = criar_grade(
+    contexto_inicial = criar_contexto(
         args.linhas,
         args.colunas,
         percentual_espalhadores=args.percentual,
+        percentual_influenciadores=args.percentual_influenciadores,
+        percentual_bots=args.percentual_bots,
+        percentual_fact_checkers=args.percentual_fact_checkers,
         semente=args.semente,
+        chance_convencimento=args.chance_convencimento,
+        peso_influenciador=args.peso_influenciador,
+        vida_influenciador=args.vida_influenciador,
+        peso_fact_checker=args.peso_fact_checker,
     )
 
     executar_distribuida(
-        grade_inicial,
+        contexto_inicial,
         args.geracoes,
         args.limiar,
         workers,
         mostrar_grade=args.mostrar_grade,
         mostrar_progresso=True,
+        gerar_grafico=args.gerar_grafico,
     )
 
 

@@ -1,4 +1,4 @@
-"""Worker da simulacao distribuida de fake news"""
+"""Worker da simulacao distribuida de fake news."""
 
 from __future__ import annotations
 
@@ -54,16 +54,20 @@ def worker_main(host, port):
                     if pedido.get("acao") != "calcular_faixa":
                         raise ValueError("Acao invalida.")
 
-                    linhas = processar_bloco_distribuido(
-                        pedido["bloco"],
+                    linhas_grade, linhas_duracao = processar_bloco_distribuido(
+                        pedido["bloco_grade"],
+                        pedido["bloco_duracoes"],
                         pedido["limiar_convencimento"],
+                        pedido["geracao"],
+                        pedido["config"],
                     )
                     _packed_send(
                         conexao,
                         {
                             "inicio": pedido["inicio"],
                             "fim": pedido["fim"],
-                            "linhas": linhas,
+                            "linhas_grade": linhas_grade,
+                            "linhas_duracao": linhas_duracao,
                         },
                     )
                 except Exception as exc:

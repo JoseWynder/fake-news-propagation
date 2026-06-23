@@ -210,4 +210,4 @@ java -cp . FakeNewsBenchmark --linhas 500 --colunas 500 --geracoes 50 --percentu
 * JOSE WYNDER ALVES HERNANDES
 * JOÃO LUCAS SILVA DE SOUZA
 * JOÃO VÍTOR OLIVEIRA ABREU
-* 
+* LUAN HENRIQUE DE ALMEIDA DOS SANTOS
